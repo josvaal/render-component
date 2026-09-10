@@ -1,0 +1,7 @@
+/* Base reset for the render host. Component styles come from the rendered component. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
