@@ -41,7 +41,9 @@ pub struct Scored {
     pub indices: Vec<usize>,
 }
 
-fn index_files(root: &Path) -> Vec<Item> {
+/// Bounded file index of `root` (noise dirs and hidden entries skipped).
+/// Shared by the TUI finder and the MCP `list_components`/`find_files` tools.
+pub(crate) fn index_files(root: &Path) -> Vec<Item> {
     let mut out = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
         // The root itself is never filtered (tempdirs/hidden roots are

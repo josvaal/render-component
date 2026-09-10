@@ -37,6 +37,14 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         no_open: bool,
     },
+
+    /// Run the MCP (Model Context Protocol) server over stdio so AI agents can
+    /// drive render-component: discover, inspect, serve and hot-swap components.
+    Mcp {
+        /// Project root the agent operates on (defaults to the current directory).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 /// Validate that a candidate project root is a usable directory (C14: early feedback).

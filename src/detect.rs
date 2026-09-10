@@ -17,6 +17,19 @@ pub enum ComponentKind {
 }
 
 impl ComponentKind {
+    /// Stable machine-readable label (MCP tool output, logs).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComponentKind::AngularStandalone => "angular-standalone",
+            ComponentKind::AngularModule => "angular-module",
+            ComponentKind::AngularModuleFile => "angular-module-file",
+            ComponentKind::React => "react",
+            ComponentKind::Svelte => "svelte",
+            ComponentKind::Vue => "vue",
+            ComponentKind::Other => "other",
+        }
+    }
+
     /// Only Angular components are renderable in v1 (D2/D4).
     pub fn renderable(self) -> bool {
         matches!(

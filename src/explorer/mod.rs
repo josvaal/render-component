@@ -4,7 +4,7 @@
 //! come from Google's Material Icons font (C19). Selection is delegated to the
 //! same serve/watcher path used headlessly, so hot-swap is identical (R7).
 
-mod finder;
+pub(crate) mod finder;
 mod nav;
 
 pub use nav::{Nav, Row};

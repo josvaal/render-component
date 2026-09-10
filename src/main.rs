@@ -3,12 +3,14 @@ mod detect;
 mod explorer;
 mod host;
 mod logs;
+pub(crate) mod mcp;
 mod pipeline;
 mod pipeline_types;
 mod serve;
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::Parser;
 
 use cli::{Cli, Command};
@@ -44,6 +46,11 @@ async fn main() -> anyhow::Result<()> {
                 sink: serve::LogSink::new(true),
             })
             .await
+        }
+        Some(Command::Mcp { path }) => {
+            let root = cli::validate_root(&path.unwrap_or_else(|| PathBuf::from(".")))
+                .context("invalid project root")?;
+            mcp::run(root).await
         }
         None => explorer::run(cli).await,
     }
