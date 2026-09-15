@@ -35,7 +35,10 @@ render-component renders a single Angular component in the browser.
 Typical loop: list_components → inspect_component → select_component \
 (returns the dev-server URL) → get_logs / get_status → stop_server. \
 Use find_files to locate files by fuzzy name and read_file to view \
-any file inside the project root.";
+any file inside the project root. \
+Cold start compiles the whole workspace and can take minutes: \
+select_component may answer {\"starting\": true} instead of blocking — \
+poll get_status until running=true and the URL appears.";
 
 /// JSON-RPC error codes used here.
 const PARSE_ERROR: i64 = -32700;
@@ -49,6 +52,13 @@ pub struct Session {
     server: Option<ServeHandle>,
     /// Component currently being served (absolute path), if any.
     current: Option<PathBuf>,
+    /// In-flight cold start, if any. The tool answers immediately and agents
+    /// poll `get_status` instead of blocking past client timeouts.
+    start_task: Option<tokio::task::JoinHandle<anyhow::Result<ServeHandle>>>,
+    /// Component the in-flight cold start was launched for.
+    starting: Option<PathBuf>,
+    /// Error of the last failed cold start, surfaced via `get_status`.
+    start_error: Option<String>,
 }
 
 impl Session {
@@ -58,6 +68,9 @@ impl Session {
             sink: LogSink::new(false),
             server: None,
             current: None,
+            start_task: None,
+            starting: None,
+            start_error: None,
         }
     }
 
@@ -186,7 +199,7 @@ fn resources_read(session: &mut Session, params: &Value) -> Result<Value, RpcErr
     let text = match uri {
         URI_STATUS => tools::status_json(session).to_string(),
         URI_LOGS => json!({ "lines": session.sink.tail(500) }).to_string(),
-        URI_COMPONENTS => tools::components_json(session.root(), None).to_string(),
+        URI_COMPONENTS => tools::components_json(session.root(), None, 0, 0).to_string(),
         other => {
             return Err(rpc_error(
                 INVALID_PARAMS,
@@ -282,6 +295,9 @@ fn prompts_get(params: &Value) -> Result<Value, RpcError> {
 /// Run the MCP server over stdin/stdout until EOF. On exit, the dev server
 /// (if the session started one) is shut down gracefully.
 pub async fn run(root: PathBuf) -> anyhow::Result<()> {
+    let lockfile = lockfile_for(&root);
+    takeover_stale_instance(&lockfile);
+    claim_lockfile(&lockfile, None);
     let mut session = Session::new(root);
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -297,10 +313,124 @@ pub async fn run(root: PathBuf) -> anyhow::Result<()> {
             stdout.flush().await?;
         }
     }
+    if let Some(task) = session.start_task.take() {
+        task.abort();
+    }
     if let Some(handle) = session.server.take() {
         handle.shutdown().await;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Orphan takeover: a client that times out or is killed mid-start leaves the
+// MCP process — and its `ng serve` child — running forever. A fresh instance
+// asks the orphan's control API to shut down gracefully first (so the child
+// dies with it), then SIGKILLs whatever remains.
+// ---------------------------------------------------------------------------
+
+/// Per-root lockfile so simultaneous MCP instances serving different projects
+/// never kill each other.
+fn lockfile_for(root: &Path) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.display().to_string().bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    std::env::temp_dir().join(format!("render-component-mcp-{hash:016x}.json"))
+}
+
+fn process_cmdline(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|c| c.replace('\0', " "))
+}
+
+/// Best-effort: POST /api/shutdown with a short timeout so the orphan's
+/// control API kills its `ng serve` child before we SIGKILL the process.
+fn request_graceful_shutdown(cli_port: u16) {
+    use std::io::Write as _;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = format!("127.0.0.1:{cli_port}");
+    if let Ok(mut stream) = TcpStream::connect_timeout(
+        &addr.parse().expect("static addr"),
+        Duration::from_secs(2),
+    ) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let req = "POST /api/shutdown HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        let _ = stream.write_all(req.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+fn takeover_stale_instance(lockfile: &Path) {
+    let record = |v: &Value| v["pid"].as_u64();
+    let stale = std::fs::read_to_string(lockfile)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(|v| {
+            record(v)
+                .map(|pid| pid != std::process::id() as u64)
+                .unwrap_or(false)
+        });
+    let Some(v) = stale else {
+        return;
+    };
+    let pid = record(&v).expect("filtered above") as u32;
+    if process_cmdline(pid).is_some_and(|c| c.contains("render-component")) {
+        if let Some(port) = v["cli_port"].as_u64() {
+            request_graceful_shutdown(port as u16);
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    let _ = std::fs::remove_file(lockfile);
+}
+
+/// (Re)write this instance's lockfile record.
+fn claim_lockfile(lockfile: &Path, cli_port: Option<u16>) {
+    let payload = json!({
+        "pid": std::process::id(),
+        "cli_port": cli_port,
+    });
+    let _ = std::fs::write(lockfile, payload.to_string());
+}
+
+/// Harvest a finished cold-start task: promote success into the live server,
+/// record failure into `start_error`. Instant when the task already finished.
+async fn harvest_start(session: &mut Session) {
+    let Some(task) = session.start_task.as_ref() else {
+        return;
+    };
+    if !task.is_finished() {
+        return;
+    }
+    let task = session.start_task.take().expect("checked above");
+    match task.await {
+        Ok(Ok(handle)) => {
+            let url = handle.vite_url.clone();
+            let cli_port = handle.cli_port;
+            session.server = Some(handle);
+            if let Some(component) = session.starting.take() {
+                session.current = Some(component);
+            }
+            session.start_error = None;
+            session.sink.push(format!("[mcp] dev server ready at {url}"));
+            claim_lockfile(&lockfile_for(&session.root), Some(cli_port));
+        }
+        Ok(Err(e)) => {
+            session.starting = None;
+            session.start_error = Some(e.to_string());
+            session.sink.push(format!("[mcp!] dev server failed: {e:#}"));
+        }
+        Err(e) => {
+            session.starting = None;
+            session.start_error = Some(format!("start task panicked: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]

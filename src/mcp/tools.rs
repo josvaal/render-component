@@ -26,13 +26,16 @@ fn tools() -> Vec<ToolDef> {
     vec![
     ToolDef {
         name: "list_components",
-        description: "List every renderable UI component under the project root \
+        description: "List renderable UI components under the project root \
                       (Angular components; React/Svelte/Vue are classified but not \
-                      renderable yet). Optionally filter by a substring of the path.",
+                      renderable yet). Optionally filter by a path substring. \
+                      Paginated: returns count/returned/nextOffset.",
         input_schema: json!({
             "type": "object",
             "properties": {
-                "filter": { "type": "string", "description": "Optional path substring filter." }
+                "filter": { "type": "string", "description": "Optional path substring filter." },
+                "limit": { "type": "integer", "description": "Max components per page (default 100)." },
+                "offset": { "type": "integer", "description": "Skip the first N matches (default 0)." }
             }
         }),
     },
@@ -53,7 +56,9 @@ fn tools() -> Vec<ToolDef> {
         name: "select_component",
         description: "Render a component in the browser: starts the dev server on a free \
                       port the first time, then hot-swaps subsequent selections without \
-                      restarting. Returns the preview URL.",
+                      restarting. Cold start can take minutes on big workspaces, so this \
+                      answers immediately with {\"starting\": true}; poll get_status \
+                      until running=true to get the URL.",
         input_schema: json!({
             "type": "object",
             "required": ["path"],
@@ -64,8 +69,9 @@ fn tools() -> Vec<ToolDef> {
     },
     ToolDef {
         name: "get_status",
-        description: "Current session state: whether the dev server is running, its URL \
-                      and ports, and which component is being served.",
+        description: "Current session state: whether the dev server is running or still \
+                      starting, its URL and ports, which component is being served, and \
+                      the last start error if any.",
         input_schema: json!({ "type": "object", "properties": {} }),
     },
     ToolDef {
@@ -148,11 +154,21 @@ pub async fn call(session: &mut Session, params: &Value) -> Result<Value, super:
     let result = match name {
         "list_components" => {
             let filter = args.get("filter").and_then(|f| f.as_str());
-            Ok(components_json(session.root(), filter))
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(100);
+            let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
+            Ok(components_json(
+                session.root(),
+                filter,
+                limit.min(10_000) as usize,
+                offset as usize,
+            ))
         }
         "inspect_component" => inspect(session, &args),
         "select_component" => select(session, &args).await,
-        "get_status" => Ok(status_json(session)),
+        "get_status" => {
+            super::harvest_start(session).await;
+            Ok(status_json(session))
+        }
         "get_logs" => {
             let tail = args.get("tail").and_then(|t| t.as_u64()).unwrap_or(100) as usize;
             Ok(json!({ "lines": session.sink.tail(tail) }))
@@ -181,7 +197,8 @@ pub async fn call(session: &mut Session, params: &Value) -> Result<Value, super:
 // ---------------------------------------------------------------------------
 
 /// Component index under the project root, classified by kind.
-pub fn components_json(root: &Path, filter: Option<&str>) -> Value {
+/// `limit` of 0 means no limit (used by the `rc://components` resource).
+pub fn components_json(root: &Path, filter: Option<&str>, limit: usize, offset: usize) -> Value {
     let items = finder::index_files(root);
     let mut components: Vec<Value> = Vec::new();
     for item in items {
@@ -203,17 +220,36 @@ pub fn components_json(root: &Path, filter: Option<&str>) -> Value {
             "renderable": kind.renderable(),
         }));
     }
-    json!({ "count": components.len(), "components": components })
+    let total = components.len();
+    let page: Vec<Value> = if limit == 0 {
+        components.into_iter().skip(offset).collect()
+    } else {
+        components.into_iter().skip(offset).take(limit).collect()
+    };
+    let mut out = json!({
+        "count": total,
+        "offset": offset,
+        "returned": page.len(),
+        "components": page,
+    });
+    if limit > 0 && offset + page.len() < total {
+        out["nextOffset"] = json!(offset + page.len());
+        out["detail"] = json!("truncated: pass limit/offset for pages, or a filter to narrow");
+    }
+    out
 }
 
 /// Live session status (tool + resource payload).
 pub fn status_json(session: &Session) -> Value {
     json!({
         "running": session.server.is_some(),
+        "starting": session.start_task.is_some(),
+        "startError": session.start_error,
         "url": session.server.as_ref().map(|h| h.vite_url.clone()),
         "cliPort": session.server.as_ref().map(|h| h.cli_port),
         "vitePort": session.server.as_ref().map(|h| h.vite_port),
         "current": session.current.as_ref().map(|c| c.display().to_string()),
+        "startingComponent": session.starting.as_ref().map(|c| c.display().to_string()),
         "root": session.root.display().to_string(),
     })
 }
@@ -269,6 +305,9 @@ async fn select(session: &mut Session, args: &Value) -> Result<Value, String> {
     // Validate first so a broken component never spins up tooling.
     let info = pipeline::validate(&path, session.root()).map_err(|e| e.to_string())?;
 
+    // Promote a just-finished cold start before deciding the route.
+    super::harvest_start(session).await;
+
     if let Some(handle) = session.server.as_ref() {
         // Hot-swap path (R7): selection file + revision bump, no restart.
         serve::write_selection_file(&selection_file_for(), &path, session.root())
@@ -283,6 +322,17 @@ async fn select(session: &mut Session, args: &Value) -> Result<Value, String> {
         }));
     }
 
+    // Cold start already in flight: report progress instead of blocking past
+    // the client's tool timeout (which is how duplicate servers used to spawn).
+    if session.start_task.is_some() {
+        return Ok(json!({
+            "starting": true,
+            "component": path_str,
+            "url": Value::Null,
+            "detail": "dev server is still starting; poll get_status until running=true"
+        }));
+    }
+
     let opts = serve::ServeOptions {
         component: path.clone(),
         root: session.root().to_path_buf(),
@@ -291,18 +341,16 @@ async fn select(session: &mut Session, args: &Value) -> Result<Value, String> {
         open_browser: false,
         sink: session.sink.clone(),
     };
-    let handle = serve::start(opts)
-        .await
-        .map_err(|e| format!("cannot start dev server: {e:#}"))?;
-    let url = handle.vite_url.clone();
-    session.server = Some(handle);
-    session.current = Some(path);
-    session.sink.push(format!("[mcp] serving {path_str} at {url}"));
+    session.start_error = None;
+    session.starting = Some(path.clone());
+    session.start_task = Some(tokio::spawn(async move { serve::start(opts).await }));
+    session.sink.push(format!("[mcp] starting dev server for {path_str}..."));
     Ok(json!({
-        "url": url,
+        "starting": true,
         "component": path_str,
+        "url": Value::Null,
         "strategy": info.strategy.as_str(),
-        "hot_swap": false,
+        "detail": "cold start launched; poll get_status until running=true"
     }))
 }
 
@@ -313,6 +361,13 @@ fn selection_file_for() -> PathBuf {
 }
 
 async fn stop(session: &mut Session) -> Result<Value, String> {
+    // A cold start still in flight: cancel it outright.
+    if let Some(task) = session.start_task.take() {
+        task.abort();
+        session.starting = None;
+        session.sink.push("[mcp] cold start cancelled");
+        return Ok(json!({ "stopped": true, "reason": "start cancelled" }));
+    }
     match session.server.take() {
         Some(handle) => {
             let url = handle.vite_url.clone();

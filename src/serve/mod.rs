@@ -18,13 +18,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{Redirect, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 
 use crate::cli;
-use crate::host::{self, HostContext};
+use crate::host;
 use crate::pipeline;
 
 #[derive(Debug, Clone)]
@@ -48,6 +48,9 @@ pub struct Ctx {
     pub build_pending: Arc<std::sync::atomic::AtomicBool>,
     /// True when the dev-server process ended unexpectedly.
     pub ng_exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared shutdown trigger: `POST /api/shutdown` and `ServeHandle::shutdown`
+    /// both flip it; the axum graceful-shutdown future watches it.
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 pub struct ServeHandle {
@@ -55,10 +58,10 @@ pub struct ServeHandle {
     #[allow(dead_code)] // part of the handle's public surface for embedders
     pub vite_port: u16,
     pub vite_url: String,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
-    watcher_task: tokio::task::JoinHandle<()>,
-    host: Option<HostContext>,
+    /// Owns the `ng serve` child: reacts to the shared shutdown trigger.
+    supervisor_task: tokio::task::JoinHandle<()>,
 }
 
 /// Reserve a free TCP port by binding and reporting it (C04). The listener is
@@ -76,6 +79,7 @@ fn router(ctx: Arc<Ctx>) -> Router {
             "/api/select",
             get(select_component_get).post(select_component),
         )
+        .route("/api/shutdown", post(shutdown_now))
         .route("/", get(redirect_root))
         .with_state(ctx)
 }
@@ -155,6 +159,14 @@ async fn handle_select(
 
 async fn redirect_root(State(ctx): State<Arc<Ctx>>) -> Redirect {
     Redirect::temporary(&format!("http://127.0.0.1:{}", ctx.vite_port))
+}
+
+/// Remote shutdown (orphan takeover): flips the shared shutdown trigger so the
+/// control API stops gracefully and the `ng serve` child is killed.
+async fn shutdown_now(State(ctx): State<Arc<Ctx>>) -> Json<serde_json::Value> {
+    ctx.sink.push("[serve] shutdown requested via API");
+    let _ = ctx.shutdown_tx.send(true);
+    Json(serde_json::json!({ "shutting_down": true }))
 }
 
 /// Validate + apply a selection; on change, regenerate the host entry so the
@@ -240,10 +252,10 @@ fn spawn_server(
     listener: TcpListener,
     ctx: Arc<Ctx>,
 ) -> anyhow::Result<(
-    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 )> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_rx = ctx.shutdown_tx.subscribe();
     let listener = {
         // std TcpListener::set_nonblocking takes &self.
         listener
@@ -253,8 +265,10 @@ fn spawn_server(
     };
     let tk_listener =
         tokio::net::TcpListener::from_std(listener).context("converting listener to tokio")?;
+    let shutdown_tx = ctx.shutdown_tx.clone();
     let server = axum::serve(tk_listener, router(ctx)).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
+        let mut rx = shutdown_rx;
+        let _ = rx.changed().await;
     });
     let task = tokio::spawn(async move {
         let _ = server.await;
@@ -277,6 +291,7 @@ pub async fn start(opts: ServeOptions) -> anyhow::Result<ServeHandle> {
 
     let build_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ng_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut ctx = Arc::new(Ctx {
         app: AppState::new(
             &component,
@@ -290,6 +305,7 @@ pub async fn start(opts: ServeOptions) -> anyhow::Result<ServeHandle> {
         sink: opts.sink.clone(),
         build_pending: build_pending.clone(),
         ng_exited: ng_exited.clone(),
+        shutdown_tx,
     });
     ctx.sink
         .push(format!("[serve] project root: {}", root.display()));
@@ -325,28 +341,42 @@ pub async fn start(opts: ServeOptions) -> anyhow::Result<ServeHandle> {
         ctx.sink
             .push(format!("[serve] opened browser at {}", host_ctx.url));
     }
-    let watcher_task = spawn_watcher(ctx, opts.selection_file.clone());
+    let watcher_task = spawn_watcher(ctx.clone(), opts.selection_file.clone());
+
+    // Supervisor: any shutdown (ServeHandle::shutdown or POST /api/shutdown)
+    // flips the shared trigger; this task then kills the `ng serve` child and
+    // stops the watcher, so no orphan survives the control API (C13).
+    let vite_port = host_ctx.vite_port;
+    let vite_url = host_ctx.url.clone();
+    let host_opt = Some(host_ctx);
+    let shutdown_rx = ctx.shutdown_tx.subscribe();
+    let supervisor_task = tokio::spawn(async move {
+        let mut rx = shutdown_rx;
+        let _ = rx.changed().await;
+        if let Some(mut host) = host_opt {
+            let _ = host.child.kill().await;
+        }
+        watcher_task.abort();
+    });
 
     Ok(ServeHandle {
         cli_port,
-        vite_port: host_ctx.vite_port,
-        vite_url: host_ctx.url.clone(),
+        vite_port,
+        vite_url,
         shutdown_tx,
         server_task,
-        watcher_task,
-        host: Some(host_ctx),
+        supervisor_task,
     })
 }
 
 impl ServeHandle {
-    /// Stop API server + watcher, kill the dev-server child, free both ports (C13).
-    pub async fn shutdown(mut self) {
-        let _ = self.shutdown_tx.send(());
+    /// Stop API server + watcher, kill the dev-server child, free both ports
+    /// (C13). The supervisor owns the child: flipping the shared trigger makes
+    /// it kill `ng serve` and stop the watcher.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
         let _ = self.server_task.await;
-        self.watcher_task.abort();
-        if let Some(mut host) = self.host.take() {
-            let _ = host.child.kill().await;
-        }
+        let _ = self.supervisor_task.await;
     }
 }
 
@@ -425,6 +455,7 @@ mod tests {
             sink: crate::logs::LogSink::new(false),
             build_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ng_exited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         });
         // Leak-free ownership: keep both tempdirs alive via the returned guard.
         std::mem::forget(host_tmp);
@@ -474,7 +505,7 @@ mod tests {
         assert!(body.contains("gallery.component.ts"), "got: {body}");
 
         // Graceful shutdown (C13): after completion the port is rebindable.
-        let _ = shutdown_tx.send(());
+        let _ = shutdown_tx.send(true);
         let _ = task.await;
         let rebind = TcpListener::bind(("127.0.0.1", port));
         assert!(rebind.is_ok(), "port {port} must be free after shutdown");
@@ -514,7 +545,7 @@ mod tests {
             "state untouched: {current}"
         );
 
-        let _ = shutdown_tx.send(());
+        let _ = shutdown_tx.send(true);
         let _ = task.await;
     }
 }
